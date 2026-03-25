@@ -1,0 +1,12 @@
+# Virtual environments
+nfl_value_tracker/venv/
+nfl_value_tracker/venv_312/
+nfl_value_tracker/venve/
+.env
+
+# Python cache
+**/__pycache__/
+*.pyc
+
+# Data & Caches
+.sr_cache/
