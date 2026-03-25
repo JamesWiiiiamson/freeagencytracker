@@ -7,7 +7,7 @@ Two data sources are combined:
   2. Play-by-play data    - EPA per play and success rate per player.
 
 These are merged on player_id to produce one row per player
-with all metrics combined.
+with all metrics combined
 """
 
 import nfl_data_py as nfl
@@ -42,8 +42,13 @@ def extract_weekly_stats(season: int = 2025) -> pd.DataFrame:
             "Unable to load weekly player stats for requested season or prior seasons."
         )
 
-    # Identity columns should be preserved, not summed.
-    id_cols = ["player_id", "player_name", "position", "recent_team", "season"]
+    # Identity columns — keep these as-is (don't sum them).
+    # player_display_name holds the full name (e.g. 'Tua Tagovailoa') used for
+    # cross-dataset matching; player_name is the abbreviated form ('T.Tagovailoa').
+    id_cols = ["player_id", "player_name", "player_display_name", "position", "recent_team", "season"]
+
+    # Only include columns that actually exist (older seasons may lack display_name).
+    id_cols = [c for c in id_cols if c in weekly.columns]
 
     # Sum all other numeric columns across the season.
     numeric_cols = [
@@ -121,6 +126,13 @@ def extract_nfl_stats(season: int = 2025) -> pd.DataFrame:
     )
 
     print(f"[T-02] Final stats DataFrame: {len(merged)} players.")
+
+    # Expose the full player name as 'player_name' for cross-dataset joining.
+    # nfl_data_py's 'player_name' is abbreviated ('A.Rodgers'); 'player_display_name'
+    # is the full name ('Aaron Rodgers') which matches Sportradar's format.
+    if "player_display_name" in merged.columns:
+        merged = merged.rename(columns={"player_name": "player_name_abbr",
+                                        "player_display_name": "player_name"})
     return merged
 
 

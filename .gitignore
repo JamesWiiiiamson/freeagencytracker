@@ -2,7 +2,10 @@
 nfl_value_tracker/venv/
 nfl_value_tracker/venv_312/
 nfl_value_tracker/venve/
+# Secrets — never commit real keys
 .env
+nfl_value_tracker/.env
+
 
 # Python cache
 **/__pycache__/
@@ -24,3 +27,6 @@ Thumbs.db
 # Editor dirs
 .vscode/
 .idea/
+
+#API KEYS
+.config.py
