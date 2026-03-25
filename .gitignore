@@ -7,6 +7,20 @@ nfl_value_tracker/venve/
 # Python cache
 **/__pycache__/
 *.pyc
+*.pyo
 
-# Data & Caches
-.sr_cache/
+# Data & caches
+**/.sr_cache/
+*.csv
+
+# Temp / scratch files
+temp_*.txt
+*.tmp
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor dirs
+.vscode/
+.idea/
