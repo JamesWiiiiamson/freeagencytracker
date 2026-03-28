@@ -1,24 +1,5 @@
 """
 T-03: Pull free-agency transactions for March 2026.
-
-Strategy
---------
-Sportradar's trial key does NOT populate contract financial fields.
-We therefore pull *who signed where* from the Daily Transactions endpoint
-and supplement financial data (contract_years, total_value_m, aav_m) from
-manual_contracts.csv, which is populated from Spotrac / OverTheCap.
-
-Data flow
----------
-1. Iterate over every day in FREE_AGENCY_YEAR / FREE_AGENCY_MONTH.
-2. For each day fetch /league/{year}/{month}/{day}/transactions.json.
-3. Keep only signing transaction codes: SGN (signed), RSGN (re-signed).
-4. Normalise to a flat DataFrame with columns:
-       player_name | position | old_team | new_team | signed_date
-5. Left-join the manual_contracts.csv on player_name to attach financials.
-6. Return the merged DataFrame.
-
-The entrypoint for pipeline use is extract_contracts().
 """
 
 import calendar
@@ -66,23 +47,6 @@ def _fetch_day_transactions(
 
 
 def _parse_players(players: list[dict], signed_date: str) -> list[dict]:
-    """
-    Extract signing rows from one day's player-transaction list.
-
-    Each player entry looks like:
-        {
-          "name": "Rachaad White",
-          "position": "RB",
-          "transactions": [
-            {
-              "transaction_code": "SGN",
-              "from_team": {"alias": "TB"},   # may be absent
-              "to_team":   {"alias": "WAS"},
-              ...
-            }
-          ]
-        }
-    """
     rows = []
     for player in players:
         for txn in player.get("transactions", []):
@@ -105,12 +69,7 @@ def extract_signings(
     month: int = FREE_AGENCY_MONTH,
     client: SportradarClient | None = None,
 ) -> pd.DataFrame:
-    """
-    Pull all signing transactions for the given year/month.
 
-    Returns a DataFrame with columns:
-        player_name | position | old_team | new_team | signed_date
-    """
     if client is None:
         client = SportradarClient()
 
@@ -135,10 +94,7 @@ def extract_signings(
 
 
 def _load_manual_financials() -> pd.DataFrame:
-    """
-    Load manual_contracts.csv and normalise the player_name column for joining.
-    Returns an empty DataFrame (with correct schema) if the file is missing.
-    """
+
     if not _MANUAL_CSV.exists():
         print("[T-03] manual_contracts.csv not found – financial columns will be null.")
         return pd.DataFrame(columns=["player_name", "contract_years", "total_value_m", "aav_m"])
@@ -159,15 +115,7 @@ def extract_contracts(
     month: int = FREE_AGENCY_MONTH,
     client: SportradarClient | None = None,
 ) -> pd.DataFrame:
-    """
-    Orchestrates pulling signings from the API and merging manual financial data.
 
-    Returns a DataFrame with the final shape:
-        player_name | position | old_team | new_team | signed_date |
-        contract_years | total_value_m | aav_m
-
-    Financial columns will be NaN for players not present in manual_contracts.csv.
-    """
     signings_df = extract_signings(year, month, client)
 
     if signings_df.empty:

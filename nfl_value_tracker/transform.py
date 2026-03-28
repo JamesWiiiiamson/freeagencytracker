@@ -194,6 +194,99 @@ def match_and_merge(
     return merged
 
 
+# ---------------------------------------------------------------------------
+# T-05 — Value metric calculation
+# ---------------------------------------------------------------------------
+
+# Tier boundaries (value_metric = epa_per_play / aav_m).
+# These are intentionally generous to keep all brackets populated even for
+# small datasets.  Tune thresholds once real data is loaded.
+_TIER_BINS   = [-float("inf"), 0.0, 0.05, 0.15, float("inf")]
+_TIER_LABELS = ["overpaid", "fair", "solid", "elite"]
+
+
+def add_value_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Append ``value_metric`` and ``value_tier`` columns to *df* (in-place copy).
+
+    value_metric = epa_per_play / aav_m
+
+    Edge-case handling
+    ------------------
+    * ``aav_m`` == 0  → NaN  (avoids ZeroDivisionError; player is on minimum)
+    * ``epa_per_play`` is NaN (unmatched player) → NaN propagates naturally
+    * Negative EPA is legal — overpaid players should surface as negative values
+
+    value_tier is assigned via ``pd.cut`` using pre-defined bin edges so that
+    the boundary semantics are stable regardless of dataset size.
+
+    Parameters
+    ----------
+    df : DataFrame returned by ``match_and_merge``; must contain
+         ``epa_per_play`` and ``aav_m`` columns.
+
+    Returns
+    -------
+    New DataFrame with two extra columns: ``value_metric``, ``value_tier``.
+    """
+    required = {"epa_per_play", "aav_m"}
+    missing  = required - set(df.columns)
+    if missing:
+        raise ValueError(f"add_value_metrics: missing required columns: {missing}")
+
+    out = df.copy()
+
+    # Replace 0 AAV with NaN so division returns NaN instead of ±inf.
+    safe_aav = out["aav_m"].replace(0, float("nan"))
+
+    # epa_per_play NaN → NaN (propagates); negative EPA → negative metric (kept).
+    out["value_metric"] = out["epa_per_play"] / safe_aav
+
+    # Tier bucketing — include_lowest so the -inf boundary is inclusive.
+    out["value_tier"] = pd.cut(
+        out["value_metric"],
+        bins=_TIER_BINS,
+        labels=_TIER_LABELS,
+        include_lowest=True,
+    )
+
+    # -----------------------------------------------------------------------
+    # Summary
+    # -----------------------------------------------------------------------
+    tier_counts = out["value_tier"].value_counts().reindex(_TIER_LABELS, fill_value=0)
+    n_null_metric = out["value_metric"].isna().sum()
+
+    print("\n" + "=" * 60)
+    print("T-05 VALUE METRIC SUMMARY")
+    print("=" * 60)
+    for tier, count in tier_counts.items():
+        print(f"  {tier:<10}: {count}")
+    print(f"  {'null':<10}: {n_null_metric}")
+    print(f"  {'total':<10}: {len(out)}")
+    print("=" * 60)
+
+    # -----------------------------------------------------------------------
+    # Correctness assertion
+    # -----------------------------------------------------------------------
+    # Any row with a real EPA value AND a non-zero AAV must have a non-null
+    # value_metric after the calculation above.
+    has_epa  = out["epa_per_play"].notna()
+    has_aav  = out["aav_m"].notna() & (out["aav_m"] != 0)
+    bad_rows = out[has_epa & has_aav & out["value_metric"].isna()]
+    if not bad_rows.empty:
+        raise AssertionError(
+            f"[T-05] {len(bad_rows)} player(s) with valid EPA + valid AAV "
+            f"ended up with null value_metric:\n{bad_rows[['player_name', 'epa_per_play', 'aav_m', 'value_metric']]}"
+        )
+    print("[T-05] Assertion passed — no valid-EPA + valid-AAV rows have null value_metric ✓")
+
+    logger.info(
+        "[T-05] value_metric computed | tiers: %s | null_metric: %d",
+        tier_counts.to_dict(), n_null_metric,
+    )
+    return out
+
+
 def run_pattern_tests() -> None:
 
     print("\n" + "=" * 60)
@@ -299,3 +392,14 @@ if __name__ == "__main__":
         f"Row count mismatch! contracts={len(contracts_df)}, merged={len(merged)}"
     )
     print("\nRow-count assertion passed ✓")
+
+    # --- T-05: value metrics ---
+    valued = add_value_metrics(merged)
+    print(f"\nSample value metrics (top 10 by value_metric):")
+    cols = ["player_name", "aav_m", "epa_per_play", "value_metric", "value_tier"]
+    available_cols = [c for c in cols if c in valued.columns]
+    print(
+        valued.sort_values("value_metric", ascending=False)
+              .head(10)[available_cols]
+              .to_string(index=False)
+    )
