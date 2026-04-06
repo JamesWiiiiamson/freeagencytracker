@@ -11,6 +11,8 @@ nfl_value_tracker/.env
 **/__pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.coverage
 
 # Data & caches
 **/.sr_cache/
@@ -27,6 +29,18 @@ Thumbs.db
 # Editor dirs
 .vscode/
 .idea/
+
+# Database files
+*.sqlite
+*.db
+*.sqlite3
+
+# Logs
+*.log
+sync_logs.txt
+
+# Outputs directory
+nfl_value_tracker/outputs/
 
 #API KEYS
 .config.py
