@@ -1,13 +1,6 @@
 """
-T-02: Pull 2025 season stats using nfl_data_py.
-Completely free, no API key needed, no rate limits.
-
-Two data sources are combined:
-  1. Weekly player stats  - totals for TDs, yards, fantasy points, etc.
-  2. Play-by-play data    - EPA per play and success rate per player.
-
-These are merged on player_id to produce one row per player
-with all metrics combined
+Season stats from nfl_data_py: weekly totals plus play-by-play EPA and success
+rate, merged on player_id.
 """
 
 import nfl_data_py as nfl
@@ -20,7 +13,7 @@ def extract_weekly_stats(season: int = 2025) -> pd.DataFrame:
     Pull weekly player stats and aggregate to full season totals.
     Returns one row per player with summed stats across all weeks.
     """
-    print(f"[T-02] Fetching weekly stats for {season}...")
+    print(f"Fetching weekly stats for {season}...")
     weekly = None
     weekly_source_season = season
     for candidate_season in range(season, 1998, -1):
@@ -29,7 +22,7 @@ def extract_weekly_stats(season: int = 2025) -> pd.DataFrame:
             weekly_source_season = candidate_season
             if candidate_season != season:
                 print(
-                    "[T-02] Weekly 2025 data unavailable; "
+                    "Weekly stats for requested season unavailable; "
                     f"using {candidate_season} as fallback."
                 )
             break
@@ -60,7 +53,7 @@ def extract_weekly_stats(season: int = 2025) -> pd.DataFrame:
     )
     season_stats["weekly_source_season"] = weekly_source_season
 
-    print(f"[T-02] Weekly stats loaded for {len(season_stats)} players.")
+    print(f"Weekly stats loaded for {len(season_stats)} players.")
     return season_stats
 
 
@@ -69,8 +62,8 @@ def extract_pbp_epa(season: int = 2025) -> pd.DataFrame:
     Pull play-by-play data and compute EPA per play and success rate by player.
     Success rate is the percentage of plays where EPA > 0.
     """
-    print(f"[T-02] Fetching play-by-play data for {season}...")
-    print("[T-02] This takes about 60 seconds on first run...")
+    print(f"Fetching play-by-play data for {season}...")
+    print("This takes about 60 seconds on first run...")
     pbp = nfl.import_pbp_data([season])
 
     # Filter to passing and rushing plays only.
@@ -106,7 +99,7 @@ def extract_pbp_epa(season: int = 2025) -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    print(f"[T-02] EPA computed for {len(epa_df)} players.")
+    print(f"EPA computed for {len(epa_df)} players.")
     return epa_df
 
 
@@ -125,7 +118,7 @@ def extract_nfl_stats(season: int = 2025) -> pd.DataFrame:
         how="left",
     )
 
-    print(f"[T-02] Final stats DataFrame: {len(merged)} players.")
+    print(f"Final stats DataFrame: {len(merged)} players.")
 
     # Expose the full player name as 'player_name' for cross-dataset joining.
     # nfl_data_py's 'player_name' is abbreviated ('A.Rodgers'); 'player_display_name'

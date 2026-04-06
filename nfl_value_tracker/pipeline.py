@@ -1,14 +1,16 @@
 """
-T-06: Full ETL pipeline — extract → transform → load.
+Full ETL pipeline — extract -> transform -> load -> validate -> report.
 
-Run this script to populate (or refresh) all three PostgreSQL tables:
+Run this script to populate (or refresh) all four PostgreSQL tables:
     dim_players
     fact_performance_2025
     fact_contracts_2026
+    dim_free_agent_status   <- NEW: unsigned FA tracker (DAZN scrape)
 
 Usage
 -----
     python pipeline.py
+    python pipeline.py --fresh   # drop all ORM tables first, then full rebuild
 
 The script is fully idempotent: re-running updates existing rows via
 INSERT ... ON CONFLICT DO UPDATE and produces identical row counts.
@@ -16,6 +18,7 @@ INSERT ... ON CONFLICT DO UPDATE and produces identical row counts.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 
@@ -32,18 +35,28 @@ logging.basicConfig(
 logger = logging.getLogger("pipeline")
 
 
-def main() -> None:
+def main(*, fresh: bool = False) -> None:
+    # ------------------------------------------------------------------
+    # Step 0 — Optional clean slate
+    # ------------------------------------------------------------------
+    from database import (
+        drop_all_tables,
+        engine,
+        init_db,
+        upsert_dim_players,
+        upsert_fact_performance,
+        upsert_free_agent_status,
+        print_row_counts,
+    )
+
+    if fresh:
+        logger.info("=== STEP 0: drop_all_tables (clean database) ===")
+        drop_all_tables()
+
     # ------------------------------------------------------------------
     # Step 1 — Init database (CREATE TABLE IF NOT EXISTS)
     # ------------------------------------------------------------------
     logger.info("=== STEP 1: init_db ===")
-    from database import (
-        init_db,
-        upsert_dim_players,
-        upsert_fact_performance,
-        upsert_fact_contracts,
-        print_row_counts,
-    )
     init_db()
 
     # ------------------------------------------------------------------
@@ -56,69 +69,48 @@ def main() -> None:
     logger.info("Stats rows: %d", len(stats_df))
 
     # ------------------------------------------------------------------
-    # Step 3 — Extract contracts (Sportradar API + manual_contracts.csv)
+    # Step 3 — Sync seasonal rosters
     # ------------------------------------------------------------------
-    logger.info("=== STEP 3: extract contracts ===")
-    from extract_contracts import extract_contracts
+    logger.info("=== STEP 3: fetch nflverse seasonal rosters ===")
+    from extract_rosters import extract_rosters
+    from config import FA_START_DATE
 
-    contracts_df = extract_contracts()
-    logger.info("Contracts rows: %d", len(contracts_df))
+    roster_df = extract_rosters(season=2026)
+    logger.info("Active nflverse players: %d", len(roster_df))
+
 
     # ------------------------------------------------------------------
-    # Step 4 — Transform: fuzzy-match contracts onto stats to get player_id
+    # Step 4 — Transform: add performance index
     # ------------------------------------------------------------------
-    logger.info("=== STEP 4: fuzzy match + value metrics ===")
-    from transform import match_and_merge, add_value_metrics
+    logger.info("=== STEP 4: performance index ===")
+    from transform import add_performance_index
 
-    merged = match_and_merge(contracts_df, stats_df)
-
-    # Carry player_id from the stats side into the merged DataFrame so
-    # fact_contracts_2026 has an FK that resolves against dim_players.
-    # The match uses player_name as the bridge; we re-attach player_id
-    # via another left join keyed on the resolved player_name.
-    if "player_id" not in merged.columns:
-        name_to_id = (
-            stats_df[["player_name", "player_id"]]
-            .dropna(subset=["player_name", "player_id"])
-            .drop_duplicates(subset=["player_name"])
-            .set_index("player_name")["player_id"]
-        )
-        merged["player_id"] = merged["player_name"].map(
-            lambda n: name_to_id.get(n) if pd.notna(n) else None
-        )
-
-    valued = add_value_metrics(merged)
+    stats_df = add_performance_index(stats_df)
 
     # ------------------------------------------------------------------
     # Step 5 — Load dim_players
     # ------------------------------------------------------------------
     logger.info("=== STEP 5: load dim_players ===")
     n_dim = upsert_dim_players(stats_df)
-    print(f"[T-06] dim_players upserted: {n_dim} rows")
+    print(f"dim_players upserted: {n_dim} rows")
 
     # ------------------------------------------------------------------
     # Step 6 — Load fact_performance_2025
     # ------------------------------------------------------------------
     logger.info("=== STEP 6: load fact_performance_2025 ===")
     n_perf = upsert_fact_performance(stats_df)
-    print(f"[T-06] fact_performance_2025 upserted: {n_perf} rows")
+    print(f"fact_performance_2025 upserted: {n_perf} rows")
 
     # ------------------------------------------------------------------
-    # Step 7 — Load fact_contracts_2026
+    # Step 7.5 — Build dim_free_agent_status (unsigned FA tracker)
     # ------------------------------------------------------------------
-    logger.info("=== STEP 7: load fact_contracts_2026 ===")
-    # Only load contracts rows that have a FK-resolvable player_id.
-    n_before_filter = len(valued)
-    contracts_with_id = valued[valued["player_id"].notna()].copy()
-    n_skipped = n_before_filter - len(contracts_with_id)
-    if n_skipped:
-        print(
-            f"[T-06] {n_skipped} contract row(s) have no player_id FK match — "
-            "skipping (unmatched signings)."
-        )
-
-    n_contracts = upsert_fact_contracts(contracts_with_id)
-    print(f"[T-06] fact_contracts_2026 upserted: {n_contracts} rows")
+    logger.info("=== STEP 7.5: upsert dim_free_agent_status ===")
+    n_unsigned, n_signed = upsert_free_agent_status(
+        stats_df, roster_df, fa_start_date=FA_START_DATE
+    )
+    print(
+        f"dim_free_agent_status: {n_signed} signed, {n_unsigned} unsigned players."
+    )
 
     # ------------------------------------------------------------------
     # Step 8 — Confirm row counts
@@ -126,35 +118,68 @@ def main() -> None:
     logger.info("=== STEP 8: row count verification ===")
     print_row_counts()
 
-    # Sanity bounds
-    with __import__("database").engine.connect() as conn:
+    # Row-count guidance (original design target vs nfl_data_py weekly scope)
+    with engine.connect() as conn:
         from sqlalchemy import text
 
-        dim_count  = conn.execute(text("SELECT COUNT(*) FROM dim_players")).scalar()
+        dim_count = conn.execute(text("SELECT COUNT(*) FROM dim_players")).scalar()
         perf_count = conn.execute(text("SELECT COUNT(*) FROM fact_performance_2025")).scalar()
-        con_count  = conn.execute(text("SELECT COUNT(*) FROM fact_contracts_2026")).scalar()
 
-    _assert_range(dim_count,  1_500, 2_000, "dim_players")
-    _assert_range(perf_count, 1_500, 2_000, "fact_performance_2025")
-    _assert_range(con_count,     30,    60,  "fact_contracts_2026")
+    _log_row_count_guidance(dim_count, perf_count)
 
-    print("[T-06] All row-count assertions passed ✓")
+    # ------------------------------------------------------------------
+    # Step 9 — Export Power BI Reports
+    # ------------------------------------------------------------------
+    logger.info("=== STEP 9: export power bi metrics ===")
+    from export_powerbi import export_powerbi
+
+    export_powerbi()
+    print("\nPipeline complete.")
 
 
-def _assert_range(count: int, lo: int, hi: int, label: str) -> None:
-    if not (lo <= count <= hi):
+def _log_row_count_guidance(dim: int, perf: int) -> None:
+    """Log actual counts; warn if far from design targets or from each other."""
+    print(
+        f"Row counts — dim_players: {dim}, "
+        f"fact_performance_2025: {perf}"
+    )
+    design_dim_perf = (1_500, 2_000)
+    if not (design_dim_perf[0] <= dim <= design_dim_perf[1]):
         logger.warning(
-            "[T-06] %s row count %d is outside expected range [%d, %d] — "
-            "check your data sources.",
-            label, count, lo, hi,
+            "dim_players=%d outside typical design band %s (nfl_data_py weekly "
+            "scope often yields ~600–900 unique players).",
+            dim,
+            design_dim_perf,
         )
     else:
-        print(f"[T-06] {label}: {count} rows  (expected {lo}–{hi}) ✓")
+        print(f"dim_players in design band {design_dim_perf} ✓")
+    if not (design_dim_perf[0] <= perf <= design_dim_perf[1]):
+        logger.warning(
+            "fact_performance_2025=%d outside typical design band %s.",
+            perf,
+            design_dim_perf,
+        )
+    else:
+        print(f"fact_performance_2025 in design band {design_dim_perf} ✓")
+    if dim != perf:
+        logger.warning(
+            "dim_players (%d) and fact_performance_2025 (%d) differ — "
+            "expected 1:1 after load.",
+            dim,
+            perf,
+        )
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="NFL FA tracker ETL pipeline.")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Drop all ORM tables before running (clean PostgreSQL rebuild).",
+    )
+    args = parser.parse_args()
     try:
-        main()
+        main(fresh=args.fresh)
     except Exception:
         logger.exception("Pipeline failed.")
         sys.exit(1)

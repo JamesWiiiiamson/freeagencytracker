@@ -5,29 +5,21 @@ Tables
 ------
 dim_players          – one row per player (PK: player_id from nfl_data_py)
 fact_performance_2025 – one row per player with 2025 EPA/fantasy stats
-fact_contracts_2026   – one row per player with 2026 free-agency contract data
+dim_free_agent_status - tracking FA signings
 
 Upsert strategy
 ---------------
-All three loaders use INSERT … ON CONFLICT (player_id) DO UPDATE so that
+Loaders use INSERT … ON CONFLICT (player_id) DO UPDATE so that
 re-running the pipeline updates existing rows rather than duplicating them.
-
-PostgreSQL note — ROUND() and ::numeric
----------------------------------------
-PostgreSQL's ROUND() requires a numeric argument; passing a float8 column
-directly raises "function round(double precision, integer) does not exist".
-Fix: cast first, e.g.  ROUND(epa_per_play::numeric, 4).
-This file uses Python-side rounding (round()) before inserting so the cast
-is unnecessary here, but keep this note for any future raw-SQL queries.
 """
 
 from __future__ import annotations
-
 import logging
 from typing import Optional
 
 import pandas as pd
 from sqlalchemy import (
+    Boolean,
     Column,
     Float,
     ForeignKey,
@@ -39,418 +31,261 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     text,
+    case,
+    DateTime
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import DeclarativeBase, Session
-
 from config import DB_URL
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Engine — one shared instance for the whole application.
-# ---------------------------------------------------------------------------
-engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
+engine = create_engine(DB_URL, echo=False)
 
-
-# ---------------------------------------------------------------------------
-# ORM Base
-# ---------------------------------------------------------------------------
 class Base(DeclarativeBase):
     pass
 
-
-# ---------------------------------------------------------------------------
-# dim_players
-# ---------------------------------------------------------------------------
 class DimPlayer(Base):
-    """
-    One row per unique player.
-    player_id comes from nfl_data_py (e.g. '00-0023459') and is stable
-    across seasons, making it the natural primary key.
-    """
-
     __tablename__ = "dim_players"
+    player_id = Column(Text, primary_key=True)
+    full_name = Column(String(100), nullable=False)
+    position  = Column(String(10), nullable=True)
+    age       = Column(SmallInteger, nullable=True)
+    team_2025 = Column(String(10), nullable=True)
 
-    player_id = Column(Text, primary_key=True, comment="nfl_data_py GSIS player ID")
-    full_name  = Column(Text,         nullable=True)
-    position   = Column(String(10),   nullable=True)
-    age        = Column(SmallInteger, nullable=True)
-    team_2025  = Column(String(10),   nullable=True, comment="Most recent 2025 team alias")
-
-
-# ---------------------------------------------------------------------------
-# fact_performance_2025
-# ---------------------------------------------------------------------------
 class FactPerformance2025(Base):
-    """
-    2025 season performance stats — one row per player.
-    A UNIQUE constraint on player_id drives the ON CONFLICT upsert.
-    """
-
     __tablename__ = "fact_performance_2025"
-    __table_args__ = (
-        UniqueConstraint("player_id", name="uq_fact_perf_player"),
-    )
+    __table_args__ = (UniqueConstraint("player_id", name="uq_fact_perf_player"),)
 
     id           = Column(Integer, primary_key=True, autoincrement=True)
     player_id    = Column(Text, ForeignKey("dim_players.player_id"), nullable=False)
     season       = Column(SmallInteger, nullable=True)
-    plays        = Column(Integer, nullable=True, comment="Pass/rush play count from PBP")
+    plays        = Column(Integer, nullable=True)
     epa_total    = Column(Float, nullable=True)
     epa_per_play = Column(Float, nullable=True)
-    success_rate = Column(Float, nullable=True, comment="Fraction of plays where EPA > 0")
-    touchdowns   = Column(Integer, nullable=True, comment="Passing + rushing + receiving TDs")
-    fantasy_pts  = Column(Float, nullable=True, comment="Half-PPR fantasy points")
+    success_rate = Column(Float, nullable=True)
+    touchdowns   = Column(Integer, nullable=True)
+    fantasy_pts  = Column(Float, nullable=True)
+    performance_index = Column(Float, nullable=True)
+    performance_grade = Column(String(10), nullable=True)
 
+class DimFreeAgentStatus(Base):
+    __tablename__ = "dim_free_agent_status"
+    __table_args__ = (UniqueConstraint("player_id", name="uq_fa_status_player"),)
 
-# ---------------------------------------------------------------------------
-# fact_contracts_2026
-# ---------------------------------------------------------------------------
-class FactContract2026(Base):
-    """
-    2026 free-agency contract data — one row per player.
-    A UNIQUE constraint on player_id drives the ON CONFLICT upsert.
-    """
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    player_id        = Column(Text, ForeignKey("dim_players.player_id"), nullable=False)
+    is_signed        = Column(Boolean, nullable=False, default=False)
+    signed_team      = Column(String(10), nullable=True)
+    signed_date      = Column(String(10), nullable=True)
+    aav_m            = Column(Float, nullable=True)
+    total_value_m    = Column(Float, nullable=True)
+    contract_years   = Column(SmallInteger, nullable=True)
+    transaction_type = Column(String(50), nullable=True)
+    days_unsigned    = Column(Integer, nullable=True)
+    last_updated     = Column(DateTime(timezone=True), nullable=True)
 
-    __tablename__ = "fact_contracts_2026"
-    __table_args__ = (
-        UniqueConstraint("player_id", name="uq_fact_contract_player"),
-    )
+_idx_perf_player = Index("ix_fact_perf_player_id", FactPerformance2025.player_id)
+_idx_fa_status   = Index("ix_dim_fa_status_player_id", DimFreeAgentStatus.player_id)
 
-    id             = Column(Integer, primary_key=True, autoincrement=True)
-    player_id      = Column(Text, ForeignKey("dim_players.player_id"), nullable=False)
-    new_team       = Column(String(10), nullable=True)
-    contract_years = Column(SmallInteger, nullable=True)
-    total_value    = Column(Float, nullable=True, comment="Total contractvalue in $M")
-    aav            = Column(Float, nullable=True, comment="Average annual value in $M")
-    value_metric   = Column(Float, nullable=True, comment="epa_per_play / aav_m")
-    value_tier     = Column(String(20), nullable=True, comment="elite|solid|fair|overpaid")
-    signing_month  = Column(SmallInteger, nullable=True, comment="Calendar month of signing (e.g. 3 = March)")
+def drop_all_tables() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS fact_contracts_2026 CASCADE;"))
+    Base.metadata.drop_all(bind=engine)
+    logger.info("drop_all_tables: all ORM tables dropped.")
 
-
-# ---------------------------------------------------------------------------
-# Indexes on FK columns in fact tables (created after table DDL)
-# ---------------------------------------------------------------------------
-_idx_perf_player     = Index("ix_fact_perf_player_id",     FactPerformance2025.player_id)
-_idx_contract_player = Index("ix_fact_contract_player_id", FactContract2026.player_id)
-
-
-# ---------------------------------------------------------------------------
-# init_db
-# ---------------------------------------------------------------------------
 def init_db() -> None:
-    """
-    Create all tables (and indexes) if they don't already exist.
-    Safe to call on every pipeline run — CREATE TABLE IF NOT EXISTS semantics.
-    """
     Base.metadata.create_all(engine)
-    logger.info("[T-06] init_db complete — all tables present.")
+    _ensure_pg_schema_extras()
+    logger.info("init_db complete")
 
-    # Verify tables are visible in pg_catalog.
-    with engine.connect() as conn:
-        result = conn.execute(
-            text(
-                "SELECT tablename FROM pg_catalog.pg_tables "
-                "WHERE schemaname = 'public' "
-                "AND tablename IN ('dim_players','fact_performance_2025','fact_contracts_2026') "
-                "ORDER BY tablename;"
-            )
-        )
-        found = [row[0] for row in result]
+def _ensure_pg_schema_extras() -> None:
+    stmts = [
+        "ALTER TABLE fact_performance_2025 ADD COLUMN IF NOT EXISTS performance_index DOUBLE PRECISION",
+        "ALTER TABLE fact_performance_2025 ADD COLUMN IF NOT EXISTS performance_grade VARCHAR(10)",
+    ]
+    with engine.begin() as conn:
+        for sql in stmts:
+            conn.execute(text(sql))
 
-    expected = {"dim_players", "fact_performance_2025", "fact_contracts_2026"}
-    missing  = expected - set(found)
-    if missing:
-        raise RuntimeError(f"[T-06] init_db: tables not found after create_all: {missing}")
-
-    print(f"[T-06] Tables confirmed in PostgreSQL: {sorted(found)}")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _safe_int(val) -> Optional[int]:
-    """Convert a value to int, returning None for NaN/None."""
     try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
+        if pd.isna(val): return None
+    except: pass
     return int(val) if val is not None else None
 
-
-def _safe_float(val, ndigits: int = 6) -> Optional[float]:
-    """Convert a value to float (rounded), returning None for NaN/None."""
+def _safe_float(val, ndigits=6) -> Optional[float]:
     try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
+        if pd.isna(val): return None
+    except: pass
     return round(float(val), ndigits) if val is not None else None
 
-
 def _safe_str(val) -> Optional[str]:
-    """Convert a value to str, returning None for NaN/None/empty."""
     try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
+        if pd.isna(val): return None
+    except: pass
     s = str(val).strip()
     return s if s else None
 
-
-# ---------------------------------------------------------------------------
-# upsert_dim_players
-# ---------------------------------------------------------------------------
 def upsert_dim_players(stats_df: pd.DataFrame) -> int:
-    """
-    Load (or update) dim_players from the weekly stats DataFrame.
-
-    Conflict resolution: ON CONFLICT (player_id) DO UPDATE — all columns
-    are refreshed so the dimension stays current on every run.
-
-    Returns the number of rows upserted.
-    """
-    required = {"player_id", "player_name"}
-    missing  = required - set(stats_df.columns)
-    if missing:
-        raise ValueError(f"upsert_dim_players: missing columns {missing}")
-
-    # Deduplicate on player_id — players who changed teams mid-season appear
-    # multiple times in the weekly groupby.  Keep the row with the most plays
-    # (or first row if plays is absent) so dim_players has one stable entry.
     deduped = stats_df.copy()
     if "plays" in deduped.columns:
-        deduped = (
-            deduped.sort_values("plays", ascending=False)
-            .drop_duplicates(subset=["player_id"], keep="first")
-        )
+        deduped = deduped.sort_values("plays", ascending=False).drop_duplicates(subset=["player_id"], keep="first")
     else:
         deduped = deduped.drop_duplicates(subset=["player_id"], keep="first")
 
-    rows: list[dict] = []
+    rows = []
     for _, r in deduped.iterrows():
         pid = _safe_str(r.get("player_id"))
-        if not pid:
-            continue
+        if not pid: continue
         rows.append(
             {
                 "player_id": pid,
-                "full_name":  _safe_str(r.get("player_name")),
-                "position":   _safe_str(r.get("position")),
-                "age":        _safe_int(r.get("age")),
-                "team_2025":  _safe_str(r.get("recent_team")),
+                "full_name": _safe_str(r.get("player_name")),
+                "position":  _safe_str(r.get("position")),
+                "age":       _safe_int(r.get("age")),
+                "team_2025": _safe_str(r.get("recent_team")),
             }
         )
-
-    if not rows:
-        logger.warning("[T-06] upsert_dim_players: no valid rows to insert.")
-        return 0
+    if not rows: return 0
 
     stmt = pg_insert(DimPlayer).values(rows)
     stmt = stmt.on_conflict_do_update(
         index_elements=["player_id"],
         set_={
-            "full_name":  stmt.excluded.full_name,
-            "position":   stmt.excluded.position,
-            "age":        stmt.excluded.age,
-            "team_2025":  stmt.excluded.team_2025,
+            "full_name": stmt.excluded.full_name,
+            "position":  stmt.excluded.position,
+            "age":       stmt.excluded.age,
+            "team_2025": stmt.excluded.team_2025,
         },
     )
-
     with Session(engine) as session:
         session.execute(stmt)
         session.commit()
-
-    logger.info("[T-06] upsert_dim_players: %d rows upserted.", len(rows))
     return len(rows)
 
-
-# ---------------------------------------------------------------------------
-# upsert_fact_performance
-# ---------------------------------------------------------------------------
 def upsert_fact_performance(stats_df: pd.DataFrame) -> int:
-    """
-    Load (or update) fact_performance_2025.
-
-    Conflict resolution: ON CONFLICT (player_id) DO UPDATE.
-    One row per player — the unique constraint on player_id is the conflict target.
-
-    Returns the number of rows upserted.
-    """
-    required = {"player_id"}
-    missing  = required - set(stats_df.columns)
-    if missing:
-        raise ValueError(f"upsert_fact_performance: missing columns {missing}")
-
-    # Deduplicate on player_id — keep the row with the most plays so we
-    # capture the player's primary role in 2025 (e.g. QB over emergency RB).
     deduped = stats_df.copy()
-    if "plays" in deduped.columns:
-        deduped = (
-            deduped.sort_values("plays", ascending=False)
-            .drop_duplicates(subset=["player_id"], keep="first")
-        )
-    else:
-        deduped = deduped.drop_duplicates(subset=["player_id"], keep="first")
+    if "season" not in deduped.columns: deduped["season"] = 2025
+    deduped = deduped.drop_duplicates(subset=["player_id"], keep="first")
 
-    rows: list[dict] = []
+    rows = []
     for _, r in deduped.iterrows():
         pid = _safe_str(r.get("player_id"))
-        if not pid:
-            continue
+        if not pid: continue
 
-        # Touchdowns: sum whichever TD columns are present.
-        td_cols = [c for c in stats_df.columns if "touchdown" in c.lower()]
-        total_tds: Optional[int] = None
-        if td_cols:
-            td_vals = [r[c] for c in td_cols if pd.notna(r[c])]
-            total_tds = int(sum(td_vals)) if td_vals else None
-
-        # Fantasy points: prefer half-PPR column if it exists.
-        fp_col = next(
-            (c for c in stats_df.columns if "fantasy_points_ppr" in c.lower() or "fantasy_points" in c.lower()),
-            None,
-        )
-        fantasy_pts = _safe_float(r[fp_col], ndigits=2) if fp_col else None
+        tds = r.get("touchdowns")
+        if pd.isna(tds):
+            keys = ["passing_tds", "rushing_tds", "receiving_tds"]
+            tds = sum([_safe_int(r.get(k)) or 0 for k in keys if k in r])
 
         rows.append(
             {
-                "player_id":    pid,
-                "season":       _safe_int(r.get("season")),
-                "plays":        _safe_int(r.get("plays")),
-                "epa_total":    _safe_float(r.get("epa_total")),
+                "player_id": pid,
+                "season": _safe_int(r.get("season")),
+                "plays": _safe_int(r.get("plays")),
+                "epa_total": _safe_float(r.get("epa_total")),
                 "epa_per_play": _safe_float(r.get("epa_per_play")),
                 "success_rate": _safe_float(r.get("success_rate")),
-                "touchdowns":   total_tds,
-                "fantasy_pts":  fantasy_pts,
+                "touchdowns": _safe_int(tds),
+                "fantasy_pts": _safe_float(r.get("fantasy_points_ppr")),
+                "performance_index": _safe_float(r.get("performance_index")),
+                "performance_grade": _safe_str(r.get("performance_grade")),
             }
         )
 
-    if not rows:
-        logger.warning("[T-06] upsert_fact_performance: no valid rows to insert.")
-        return 0
-
+    if not rows: return 0
     stmt = pg_insert(FactPerformance2025).values(rows)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_fact_perf_player",
         set_={
-            "season":       stmt.excluded.season,
             "plays":        stmt.excluded.plays,
             "epa_total":    stmt.excluded.epa_total,
             "epa_per_play": stmt.excluded.epa_per_play,
             "success_rate": stmt.excluded.success_rate,
             "touchdowns":   stmt.excluded.touchdowns,
             "fantasy_pts":  stmt.excluded.fantasy_pts,
+            "performance_index": stmt.excluded.performance_index,
+            "performance_grade": stmt.excluded.performance_grade,
         },
     )
-
     with Session(engine) as session:
         session.execute(stmt)
         session.commit()
-
-    logger.info("[T-06] upsert_fact_performance: %d rows upserted.", len(rows))
     return len(rows)
 
+def upsert_free_agent_status(stats_df: pd.DataFrame, roster_df: pd.DataFrame, fa_start_date: str = "2026-03-12") -> tuple[int, int]:
+    from datetime import date
+    import datetime as _dt
+    today = date.today()
+    try: fa_start = date.fromisoformat(fa_start_date)
+    except: fa_start = date(2026, 3, 12)
+    days_since_fa = (today - fa_start).days
 
-# ---------------------------------------------------------------------------
-# upsert_fact_contracts
-# ---------------------------------------------------------------------------
-def upsert_fact_contracts(contracts_df: pd.DataFrame) -> int:
-    """
-    Load (or update) fact_contracts_2026 from the merged contracts DataFrame
-    (output of transform.match_and_merge + transform.add_value_metrics).
+    signed_pids = set(roster_df["player_id"].dropna())
+    team_map = roster_df.set_index("player_id")["team"].to_dict()
+    status_map = roster_df.set_index("player_id")["status"].to_dict() if "status" in roster_df.columns else {}
 
-    Requires a 'player_id' column — call this after attaching player_ids
-    from the stats merge.  Rows without a player_id are logged and skipped.
+    rows_unsigned, rows_signed = [], []
+    stats_deduped = stats_df[["player_id", "player_name"]].dropna(subset=["player_id"]).drop_duplicates(subset=["player_id"])
 
-    Conflict resolution: ON CONFLICT (player_id) DO UPDATE.
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
+    today_str = today.isoformat()
+    fa_statuses = {'UFA', 'FREE', 'CUT', 'RFA'}
 
-    Returns the number of rows upserted.
-    """
-    if "player_id" not in contracts_df.columns:
-        raise ValueError(
-            "upsert_fact_contracts: 'player_id' column is required. "
-            "Ensure contracts_df was joined with stats_df before loading."
-        )
-
-    # Deduplicate on player_id to prevent cardinality violations during upsert.
-    deduped = contracts_df.drop_duplicates(subset=["player_id"], keep="first")
-
-    rows: list[dict] = []
-    skipped = 0
-    for _, r in deduped.iterrows():
+    for _, r in stats_deduped.iterrows():
         pid = _safe_str(r.get("player_id"))
-        if not pid:
-            skipped += 1
-            continue
+        if not pid: continue
 
-        # Extract signing month from the signed_date column if present.
-        signing_month: Optional[int] = None
-        raw_date = r.get("signed_date")
-        if raw_date and not pd.isna(raw_date):
-            try:
-                signing_month = pd.to_datetime(raw_date).month
-            except Exception:
-                pass
+        # A player is unsigned if they aren't on the roster OR their status explicitly says they are available
+        is_unsigned = (pid not in signed_pids) or (str(status_map.get(pid)).upper() in fa_statuses)
 
-        rows.append(
-            {
-                "player_id":      pid,
-                "new_team":       _safe_str(r.get("new_team")),
-                "contract_years": _safe_int(r.get("contract_years")),
-                "total_value":    _safe_float(r.get("total_value_m")),
-                "aav":            _safe_float(r.get("aav_m")),
-                "value_metric":   _safe_float(r.get("value_metric")),
-                "value_tier":     _safe_str(r.get("value_tier")),
-                "signing_month":  signing_month,
-            }
+        if not is_unsigned:
+            rows_signed.append({
+                "player_id": pid, "is_signed": True, "signed_team": _safe_str(team_map.get(pid)),
+                "signed_date": today_str, "aav_m": None, "total_value_m": None, "contract_years": None,
+                "transaction_type": "roster_sync", "days_unsigned": 0, "last_updated": now_utc
+            })
+        else:
+            rows_unsigned.append({
+                "player_id": pid, "is_signed": False, "signed_team": None, "signed_date": None,
+                "aav_m": None, "total_value_m": None, "contract_years": None, "transaction_type": None,
+                "days_unsigned": max(days_since_fa, 0), "last_updated": now_utc
+            })
+
+    def _upsert_batch(batch):
+        if not batch: return 0
+        stmt = pg_insert(DimFreeAgentStatus).values(batch)
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_fa_status_player",
+            set_={
+                "is_signed": stmt.excluded.is_signed,
+                "signed_team": stmt.excluded.signed_team,
+                "signed_date": case((DimFreeAgentStatus.is_signed.is_(False) & stmt.excluded.is_signed.is_(True), stmt.excluded.signed_date), else_=DimFreeAgentStatus.signed_date),
+                "aav_m": stmt.excluded.aav_m,
+                "total_value_m": stmt.excluded.total_value_m,
+                "contract_years": stmt.excluded.contract_years,
+                "transaction_type": stmt.excluded.transaction_type,
+                "days_unsigned": stmt.excluded.days_unsigned,
+                "last_updated": stmt.excluded.last_updated,
+            },
         )
+        with Session(engine) as session:
+            session.execute(stmt)
+            session.commit()
+        return len(batch)
 
-    if skipped:
-        logger.warning(
-            "[T-06] upsert_fact_contracts: skipped %d rows with no player_id.", skipped
-        )
+    n_signed = _upsert_batch(rows_signed)
+    n_unsigned = _upsert_batch(rows_unsigned)
+    return n_unsigned, n_signed
 
-    if not rows:
-        logger.warning("[T-06] upsert_fact_contracts: no valid rows to insert.")
-        return 0
-
-    stmt = pg_insert(FactContract2026).values(rows)
-    stmt = stmt.on_conflict_do_update(
-        constraint="uq_fact_contract_player",
-        set_={
-            "new_team":       stmt.excluded.new_team,
-            "contract_years": stmt.excluded.contract_years,
-            "total_value":    stmt.excluded.total_value,
-            "aav":            stmt.excluded.aav,
-            "value_metric":   stmt.excluded.value_metric,
-            "value_tier":     stmt.excluded.value_tier,
-            "signing_month":  stmt.excluded.signing_month,
-        },
-    )
-
-    with Session(engine) as session:
-        session.execute(stmt)
-        session.commit()
-
-    logger.info("[T-06] upsert_fact_contracts: %d rows upserted.", len(rows))
-    return len(rows)
-
-
-# ---------------------------------------------------------------------------
-# Convenience: confirm row counts
-# ---------------------------------------------------------------------------
 def print_row_counts() -> None:
-    """Print current row counts for all three tables."""
-    tables = ["dim_players", "fact_performance_2025", "fact_contracts_2026"]
-    print("\n" + "=" * 50)
-    print("T-06 ROW COUNTS")
-    print("=" * 50)
+    tables = ["dim_players", "fact_performance_2025", "dim_free_agent_status"]
+    print("\\n==================================================")
+    print("ROW COUNTS")
+    print("==================================================")
     with engine.connect() as conn:
         for tbl in tables:
             count = conn.execute(text(f"SELECT COUNT(*) FROM {tbl}")).scalar()
             print(f"  {tbl:<30}: {count:>6} rows")
-    print("=" * 50 + "\n")
+    print("==================================================\\n")

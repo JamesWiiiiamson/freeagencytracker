@@ -1,288 +1,165 @@
 from __future__ import annotations
 
-import re
 import logging
+import re
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 from thefuzz import fuzz, process as fuzz_process
 
-from config import FUZZY_THRESHOLD
+from config import FUZZY_THRESHOLD, MIN_PLAYS
 
 logger = logging.getLogger(__name__)
 
-# Suffixes that commonly differ between datasets (strip before comparing).
-_SUFFIX_RE = re.compile(
-    r"\b(jr\.?|sr\.?|ii|iii|iv|v)\b", flags=re.IGNORECASE
-)
-_NON_ALNUM_RE = re.compile(r"[^a-z0-9 ]")
 
-
-def _normalise(name: str) -> str:
-    """
-    Return a canonical form of a player name for comparison:
-      1. Lowercase + strip
-      2. Remove common generational suffixes (Jr., II, etc.)
-      3. Strip all non-alphanumeric characters (handles D.J. → dj)
-      4. Collapse multiple spaces
-    """
-    name = name.lower().strip()
-    name = _SUFFIX_RE.sub("", name)
-    name = _NON_ALNUM_RE.sub("", name)
-    return " ".join(name.split())  # collapse runs of whitespace
-
-
-
-
-def _build_lookup(stats_df: pd.DataFrame) -> dict[str, str]:
-    """
-    Build a {normalised_name: original_name} dict from the stats DataFrame.
-    Allows O(1) exact-path look-ups.
-    """
-    return {_normalise(name): name for name in stats_df["player_name"].dropna()}
-
-
-def _match_one(
-    contracts_name: str,
-    lookup: dict[str, str],
-    fuzzy_choices: list[str],
-    threshold: int,
-) -> tuple[Optional[str], Optional[int], Optional[str]]:
-    """
-    Attempt to find the best match for a single contracts-side player name.
-
-    Returns
-    -------
-    (matched_stats_name, score, method)
-      matched_stats_name : the original stats-side name if matched, else None
-      score              : 100 for exact, fuzzy score, or None
-      method             : "exact", "fuzzy", or None
-    """
-    key = _normalise(contracts_name)
-
-    # --- Phase 1: exact fast path ---
-    if key in lookup:
-        return lookup[key], 100, "exact"
-
-    # --- Phase 2: fuzzy fallback ---
-    if not fuzzy_choices:
-        return None, None, None
-
-    result = fuzz_process.extractOne(
-        key,
-        fuzzy_choices,          # these are already normalised
-        scorer=fuzz.token_sort_ratio,
-    )
-
-    if result is None:
-        logger.warning(
-            "NO_FUZZY_CANDIDATE | contracts: %r", contracts_name
-        )
-        return None, None, None
-
-    best_key, score = result[0], result[1]
-
-    if score >= threshold:
-        return lookup[best_key], score, "fuzzy"
-
-    # Below threshold — log and return unmatched.
-    # Find the best *original* candidate name for the log.
-    best_original = lookup.get(best_key, best_key)
-    logger.warning(
-        "BELOW_THRESHOLD | contracts: %r | best_candidate: %r | score: %d | threshold: %d",
-        contracts_name,
-        best_original,
-        score,
-        threshold,
-    )
-    return None, score, None
-
-
-def match_and_merge(
-    contracts_df: pd.DataFrame,
-    stats_df: pd.DataFrame,
-    threshold: int = FUZZY_THRESHOLD,
-) -> pd.DataFrame:
-    """
-    Join contracts_df (left) onto stats_df (right) by player name.
-
-    Parameters
-    ----------
-    contracts_df : DataFrame from extract_contracts.extract_contracts()
-    stats_df     : DataFrame from extract_stats.extract_nfl_stats()
-    threshold    : Fuzzy score floor (0–100); pulled from config.FUZZY_THRESHOLD.
-
-    Returns
-    -------
-    DataFrame with every contracts row preserved (left join semantics).
-    Unmatched rows have NaN for all stats columns.
-    Extra columns added: match_score (int), match_method (str).
-    """
-    if "player_name" not in contracts_df.columns:
-        raise ValueError("contracts_df is missing 'player_name' column.")
-    if "player_name" not in stats_df.columns:
-        raise ValueError("stats_df is missing 'player_name' column.")
-
-    lookup = _build_lookup(stats_df)
-    # Pre-build the sorted list of normalised keys for fuzzy search.
-    fuzzy_choices = sorted(lookup.keys())
-
-    matched_stats_names: list[Optional[str]] = []
-    scores: list[Optional[int]] = []
-    methods: list[Optional[str]] = []
-
-    for contracts_name in contracts_df["player_name"]:
-        stats_name, score, method = _match_one(
-            contracts_name, lookup, fuzzy_choices, threshold
-        )
-        matched_stats_names.append(stats_name)
-        scores.append(score)
-        methods.append(method)
-
-    # Attach match metadata to contracts.
-    work = contracts_df.copy()
-    work["_stats_name"] = matched_stats_names
-    work["match_score"] = scores
-    work["match_method"] = methods
-
-    # Merge with stats on the resolved stats-side name.
-    stats_cols = [c for c in stats_df.columns if c != "player_name"]
-    stats_keyed = stats_df.rename(columns={"player_name": "_stats_name"})
-
-    # Guard: deduplicate stats on the join key to prevent fan-out (one contracts
-    # row matching multiple stats rows for the same player).  If the stats
-    # DataFrame has duplicate player names (e.g. QB listed as both QB and KN),
-    # aggregate numeric columns with mean and drop duplicates elsewhere.
-    dupes = stats_keyed["_stats_name"].duplicated(keep=False)
-    if dupes.any():
-        dup_names = stats_keyed.loc[dupes, "_stats_name"].unique().tolist()
-        logger.warning(
-            "[T-04] %d duplicate player name(s) in stats — aggregating: %s",
-            len(dup_names), dup_names[:10],
-        )
-        numeric_cols = stats_keyed.select_dtypes("number").columns.tolist()
-        non_numeric = [c for c in stats_cols if c not in numeric_cols]
-        agg_dict = {c: "mean" for c in numeric_cols}
-        agg_dict.update({c: "first" for c in non_numeric if c != "_stats_name"})
-        stats_keyed = (
-            stats_keyed.groupby("_stats_name", as_index=False)
-            .agg(agg_dict)
-            .reset_index(drop=True)
-        )
-
-    merged = work.merge(
-        stats_keyed[["_stats_name"] + stats_cols],
-        on="_stats_name",
-        how="left",
-    )
-    merged = merged.drop(columns=["_stats_name"])
-
-
-    # Summary log.
-    n_exact = (merged["match_method"] == "exact").sum()
-    n_fuzzy = (merged["match_method"] == "fuzzy").sum()
-    n_none  = merged["match_method"].isna().sum()
-    logger.info(
-        "[T-04] Match summary | exact: %d | fuzzy: %d | unmatched: %d | total: %d",
-        n_exact, n_fuzzy, n_none, len(merged),
-    )
-    print(
-        f"[T-04] Match summary -> exact: {n_exact} | fuzzy: {n_fuzzy} "
-        f"| unmatched: {n_none} | total: {len(merged)}"
-    )
-
-    return merged
 
 
 # ---------------------------------------------------------------------------
-# T-05 — Value metric calculation
+# Performance index (on-field only — no contract ROI)
 # ---------------------------------------------------------------------------
 
-# Tier boundaries (value_metric = epa_per_play / aav_m).
-# These are intentionally generous to keep all brackets populated even for
-# small datasets.  Tune thresholds once real data is loaded.
-_TIER_BINS   = [-float("inf"), 0.0, 0.05, 0.15, float("inf")]
-_TIER_LABELS = ["overpaid", "fair", "solid", "elite"]
+_GRADE_LABELS = ["A+", "A", "B+", "B", "C", "D", "F"]
 
 
-def add_value_metrics(df: pd.DataFrame) -> pd.DataFrame:
+def _stats_position_key(df: pd.DataFrame) -> pd.Series:
+    """Use nflverse position from the stats merge (handles position_x / position_y)."""
+    if "position_y" in df.columns:
+        s = df["position_y"]
+    elif "position" in df.columns:
+        s = df["position"]
+    else:
+        s = pd.Series("__UNK__", index=df.index)
+    return (
+        s.fillna("__UNK__")
+        .astype(str)
+        .str.strip()
+        .replace("", "__UNK__")
+    )
+
+
+def _touchdown_series(df: pd.DataFrame) -> pd.Series:
+    parts: list[pd.Series] = []
+    for c in ("passing_tds", "rushing_tds", "receiving_tds"):
+        if c in df.columns:
+            parts.append(pd.to_numeric(df[c], errors="coerce").fillna(0))
+    if parts:
+        t = parts[0]
+        for p in parts[1:]:
+            t = t + p
+        return t
+    td_cols = [c for c in df.columns if "touchdown" in c.lower()]
+    if td_cols:
+        return df[td_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+    return pd.Series(0.0, index=df.index, dtype=float)
+
+
+def _group_z(s: pd.Series) -> pd.Series:
+    m = float(s.mean())
+    st = float(s.std(ddof=0))
+    if st != st or st < 1e-9:
+        return pd.Series(0.0, index=s.index)
+    return (s - m) / st
+
+
+def _z_to_grade(z: float) -> str | None:
+    if z is None or (isinstance(z, float) and z != z):
+        return None
+    if z >= 1.5:
+        return "A+"
+    if z >= 1.0:
+        return "A"
+    if z >= 0.5:
+        return "B+"
+    if z >= 0.0:
+        return "B"
+    if z >= -0.5:
+        return "C"
+    if z >= -1.0:
+        return "D"
+    return "F"
+
+
+def add_performance_index(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Append ``value_metric`` and ``value_tier`` columns to *df* (in-place copy).
+    Add ``performance_index`` and ``performance_grade`` from prior-season stats.
 
-    value_metric = epa_per_play / aav_m
+    Grades are driven by **position-relative EPA per play** (z-score within
+    each position among rows in this frame — typically March FA signings).
 
-    Edge-case handling
-    ------------------
-    * ``aav_m`` == 0  → NaN  (avoids ZeroDivisionError; player is on minimum)
-    * ``epa_per_play`` is NaN (unmatched player) → NaN propagates naturally
-    * Negative EPA is legal — overpaid players should surface as negative values
+    ``performance_index`` blends, with position-relative z-scores:
+      ~ efficiency: epa_per_play
+      ~ volume: log1p(plays), epa_total
+      ~ impact: success_rate, log1p(touchdowns)
 
-    value_tier is assigned via ``pd.cut`` using pre-defined bin edges so that
-    the boundary semantics are stable regardless of dataset size.
+    Rows without matched stats (no EPA / plays) get null performance fields.
 
-    Parameters
-    ----------
-    df : DataFrame returned by ``match_and_merge``; must contain
-         ``epa_per_play`` and ``aav_m`` columns.
-
-    Returns
-    -------
-    New DataFrame with two extra columns: ``value_metric``, ``value_tier``.
+    Note
+    ----
+    Stats are from the **prior** nflverse season (e.g. 2025). They proxy
+    “how good the player was recently,” not literal production for the **new**
+    team until you load post-signing game data.
     """
-    required = {"epa_per_play", "aav_m"}
-    missing  = required - set(df.columns)
+    required = {"epa_per_play", "plays"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"add_value_metrics: missing required columns: {missing}")
+        raise ValueError(f"add_performance_index: missing columns: {missing}")
 
     out = df.copy()
+    out["performance_index"] = np.nan
+    out["performance_grade"] = pd.NA
 
-    # Replace 0 AAV with NaN so division returns NaN instead of ±inf.
-    safe_aav = out["aav_m"].replace(0, float("nan"))
-
-    # epa_per_play NaN → NaN (propagates); negative EPA → negative metric (kept).
-    out["value_metric"] = out["epa_per_play"] / safe_aav
-
-    # Tier bucketing — include_lowest so the -inf boundary is inclusive.
-    out["value_tier"] = pd.cut(
-        out["value_metric"],
-        bins=_TIER_BINS,
-        labels=_TIER_LABELS,
-        include_lowest=True,
+    epa_pp = pd.to_numeric(out["epa_per_play"], errors="coerce")
+    plays = pd.to_numeric(out["plays"], errors="coerce")
+    epa_tot = (
+        pd.to_numeric(out["epa_total"], errors="coerce")
+        if "epa_total" in out.columns
+        else epa_pp * plays
     )
+    succ = (
+        pd.to_numeric(out["success_rate"], errors="coerce")
+        if "success_rate" in out.columns
+        else pd.Series(np.nan, index=out.index)
+    )
+    tds = _touchdown_series(out)
 
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-    tier_counts = out["value_tier"].value_counts().reindex(_TIER_LABELS, fill_value=0)
-    n_null_metric = out["value_metric"].isna().sum()
+    valid = epa_pp.notna() & plays.notna() & (plays >= MIN_PLAYS) & succ.notna()
+    if not valid.any():
+        logger.warning(f"add_performance_index: no rows with plays >= {MIN_PLAYS}, EPA, and Success Rate.")
+        return out
+
+    w = out.loc[valid].copy()
+    idx = w.index
+    w["_pk"] = _stats_position_key(w)
+    w["_epa_pp"] = epa_pp.loc[idx]
+    w["_succ"] = succ.loc[idx]
+
+    w["_perf_idx"] = (0.7 * w["_epa_pp"]) + (0.3 * w["_succ"])
+
+    # We still assign grades based on positional z-score of the new performance index
+    gkey = "_pk"
+    w["_z_perf"] = w.groupby(gkey, group_keys=False)["_perf_idx"].transform(_group_z)
+
+    grades = w["_z_perf"].apply(
+        lambda x: _z_to_grade(float(x)) if pd.notna(x) else pd.NA
+    )
+    out.loc[w.index, "performance_index"] = w["_perf_idx"]
+    out.loc[w.index, "performance_grade"] = grades
 
     print("\n" + "=" * 60)
-    print("T-05 VALUE METRIC SUMMARY")
+    print("PERFORMANCE INDEX (on-field, no contract ROI)")
     print("=" * 60)
-    for tier, count in tier_counts.items():
-        print(f"  {tier:<10}: {count}")
-    print(f"  {'null':<10}: {n_null_metric}")
-    print(f"  {'total':<10}: {len(out)}")
+    gcounts = (
+        out["performance_grade"].value_counts().reindex(_GRADE_LABELS, fill_value=0)
+    )
+    for g, c in gcounts.items():
+        print(f"  {g:<4}: {c}")
+    print(f"  null index: {out['performance_index'].isna().sum()} / {len(out)}")
     print("=" * 60)
-
-    # -----------------------------------------------------------------------
-    # Correctness assertion
-    # -----------------------------------------------------------------------
-    # Any row with a real EPA value AND a non-zero AAV must have a non-null
-    # value_metric after the calculation above.
-    has_epa  = out["epa_per_play"].notna()
-    has_aav  = out["aav_m"].notna() & (out["aav_m"] != 0)
-    bad_rows = out[has_epa & has_aav & out["value_metric"].isna()]
-    if not bad_rows.empty:
-        raise AssertionError(
-            f"[T-05] {len(bad_rows)} player(s) with valid EPA + valid AAV "
-            f"ended up with null value_metric:\n{bad_rows[['player_name', 'epa_per_play', 'aav_m', 'value_metric']]}"
-        )
-    print("[T-05] Assertion passed — no valid-EPA + valid-AAV rows have null value_metric ✓")
 
     logger.info(
-        "[T-05] value_metric computed | tiers: %s | null_metric: %d",
-        tier_counts.to_dict(), n_null_metric,
+        "performance_index computed | grade distribution: %s",
+        gcounts.to_dict(),
     )
     return out
 
@@ -290,7 +167,7 @@ def add_value_metrics(df: pd.DataFrame) -> pd.DataFrame:
 def run_pattern_tests() -> None:
 
     print("\n" + "=" * 60)
-    print("T-04 PATTERN TESTS")
+    print("PATTERN TESTS")
     print("=" * 60)
 
     # Synthetic 'stats' side.
@@ -393,13 +270,20 @@ if __name__ == "__main__":
     )
     print("\nRow-count assertion passed ✓")
 
-    # --- T-05: value metrics ---
-    valued = add_value_metrics(merged)
-    print(f"\nSample value metrics (top 10 by value_metric):")
-    cols = ["player_name", "aav_m", "epa_per_play", "value_metric", "value_tier"]
+    # --- performance index (on-field) ---
+    valued = add_performance_index(merged)
+    print("\nSample performance (top 10 by performance_index):")
+    cols = [
+        "player_name",
+        "new_team",
+        "epa_per_play",
+        "plays",
+        "performance_index",
+        "performance_grade",
+    ]
     available_cols = [c for c in cols if c in valued.columns]
     print(
-        valued.sort_values("value_metric", ascending=False)
-              .head(10)[available_cols]
-              .to_string(index=False)
+        valued.sort_values("performance_index", ascending=False, na_position="last")
+        .head(10)[available_cols]
+        .to_string(index=False)
     )

@@ -29,7 +29,7 @@ SPORTRADAR_BASE = "https://api.sportradar.com/nfl/official/trial/v7/en"
 # ---------------------------------------------------------------------------
 SEASON_YEAR      = 2025
 SEASON_TYPE      = "REG"
-MIN_PLAYS        = 100
+MIN_PLAYS        = 25
 FUZZY_THRESHOLD  = 85
 RATE_LIMIT_DELAY = 1.1
 
@@ -38,3 +38,16 @@ RATE_LIMIT_DELAY = 1.1
 # ---------------------------------------------------------------------------
 FREE_AGENCY_YEAR  = 2026
 FREE_AGENCY_MONTH = 3  # March
+
+# ---------------------------------------------------------------------------
+# DAZN free-agency tracker scrape
+# ---------------------------------------------------------------------------
+DAZN_URL = (
+    "https://www.dazn.com/en-CA/news/football/"
+    "nfl-news-2026-nfl-free-agency-tracker-latest-signings-trades-contracts/"
+    "scuexopthto71ahp3n10anx2j"
+)
+# Official start of 2026 NFL free agency (used to compute days_unsigned)
+FA_START_DATE = "2026-03-12"
+# HTTP timeout in seconds for DAZN page fetch
+DAZN_TIMEOUT_S = 20
