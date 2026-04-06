@@ -28,3 +28,6 @@ Automated ETL pipeline for tracking the best value in NFL Free Agency. This proj
 - PostgreSQL server installed and running.
 - Valid API keys assigned in your local `.env`.
 
+## Dashboard Preview
+![Power BI Dashboard Overview](assets/Free_Agency_Steals_Bargraph.png)
+![Power BI Dashboard Overview](assets/Free_Agency_Steals_Scatterplot.png)
