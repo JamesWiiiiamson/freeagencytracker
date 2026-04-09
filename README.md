@@ -31,4 +31,5 @@ Automated ETL pipeline for tracking the best value in NFL Free Agency. This proj
 ## Dashboard Preview
 ![Power BI Dashboard Overview](nfl_value_tracker/assets/Free_Agency_Steals_Bargraph.png)
 ![Power BI Dashboard Overview](nfl_value_tracker/assets/Free_Agency_Steals_Scatterplot.png)
+![Power BI Dashboard Overview](nfl_value_tracker/assets/Free_Agency_Steals_Bargraph2.png)
 
